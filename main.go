@@ -18,23 +18,33 @@ import (
 const (
 	httpPort = ":8080"
 	tcpPort  = ":8081"
+	dataFile = "kvstore.json"
+	syncInterval = 5 * time.Second
 )
 
 type KeyValueStore struct {
 	mu    sync.RWMutex
 	store map[string]string
+	dirty bool
 }
 
-func NewKeyValueStore() *KeyValueStore {
-	return &KeyValueStore{
+func NewKeyValueStore() (*KeyValueStore, error) {
+	kvs := &KeyValueStore{
 		store: make(map[string]string),
 	}
+	
+	if err := kvs.loadFromDisk(); err != nil {
+		return nil, err
+	}
+	
+	return kvs, nil
 }
 
 func (kvs *KeyValueStore) Set(key, value string) {
 	kvs.mu.Lock()
 	defer kvs.mu.Unlock()
 	kvs.store[key] = value
+	kvs.dirty = true
 }
 
 func (kvs *KeyValueStore) Get(key string) (string, bool) {
@@ -50,9 +60,84 @@ func (kvs *KeyValueStore) Count() int {
 	return len(kvs.store)
 }
 
+func (kvs *KeyValueStore) loadFromDisk() error {
+	file, err := os.Open(dataFile)
+	if os.IsNotExist(err) {
+		return nil // File doesn't exist, start with empty store
+	} else if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	return json.NewDecoder(file).Decode(&kvs.store)
+}
+
+func (kvs *KeyValueStore) saveToDisk() error {
+	kvs.mu.Lock()
+	defer kvs.mu.Unlock()
+
+	if !kvs.dirty {
+		return nil // No changes to save
+	}
+
+	tempFile := dataFile + ".tmp"
+	file, err := os.Create(tempFile)
+	if err != nil {
+		return err
+	}
+
+	if err := json.NewEncoder(file).Encode(kvs.store); err != nil {
+		file.Close()
+		return err
+	}
+
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+
+	if err := file.Close(); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tempFile, dataFile); err != nil {
+		return err
+	}
+
+	kvs.dirty = false
+	return nil
+}
+
+func (kvs *KeyValueStore) startSyncRoutine(ctx context.Context) {
+	ticker := time.NewTicker(syncInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := kvs.saveToDisk(); err != nil {
+				log.Printf("Error saving to disk: %v", err)
+			}
+		case <-ctx.Done():
+			if err := kvs.saveToDisk(); err != nil {
+				log.Printf("Error saving to disk during shutdown: %v", err)
+			}
+			return
+		}
+	}
+}
+
 func main() {
-	kvs := NewKeyValueStore()
+	kvs, err := NewKeyValueStore()
+	if err != nil {
+		log.Fatalf("Error creating key-value store: %v", err)
+	}
 	
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	
+	go kvs.startSyncRoutine(ctx)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/set", kvs.handleSet)
 	mux.HandleFunc("/get", kvs.handleGet)
@@ -91,6 +176,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	fmt.Println("Shutdown signal received")
+	cancel() // Stop the sync routine
 	gracefulShutdown(server)
 }
 
